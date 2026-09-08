@@ -5,3 +5,5 @@
 !database.rules.json
 !storage.rules
 !entrypoint.sh
+!package.json
+!package-lock.json

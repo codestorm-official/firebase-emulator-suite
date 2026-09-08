@@ -9,6 +9,7 @@
     "storage": { "host": "0.0.0.0", "port": 9199 },
     "ui": { "enabled": true, "host": "0.0.0.0", "port": 4000 },
     "hub": { "host": "0.0.0.0", "port": 4400 },
+    "logging": { "host": "0.0.0.0", "port": 4500 },
     "singleProjectMode": true
   }
 }

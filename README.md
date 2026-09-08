@@ -6,6 +6,7 @@ UI for inspecting test data. This is **not production Firebase hosting**: the
 emulators and deliberately open security rules are for development/testing only.
 Never copy these rules to production or store sensitive data here. The UI has no
 authentication; restrict access through your network when needed.
+No real Firebase account or Google credentials are required.
 
 ## Services
 
@@ -19,8 +20,10 @@ authentication; restrict access through your network when needed.
 | Emulator Hub (internal discovery/control) | 4400 |
 
 All configured listeners bind to `0.0.0.0`. `singleProjectMode` is enabled.
+The CLI also uses internal UI logging on port 4500 and Firestore UI WebSocket
+traffic on port 9150. These are UI support endpoints, not additional Firebase services.
 Functions, Hosting, Pub/Sub, and Eventarc are not enabled. No external database,
-Firebase login, real Firebase credentials, or `GOOGLE_APPLICATION_CREDENTIALS`
+Firebase login, `FIREBASE_TOKEN`, service accounts, or `GOOGLE_APPLICATION_CREDENTIALS`
 is required. Use the same project ID in every connected application; the default
 `demo-railway` is a demo project, so it needs no real Firebase project.
 
@@ -29,6 +32,7 @@ is required. Use the same project ID in every connected application; the default
 1. Push these files to a Git repository and create a Railway service from it.
    Railway builds the root Dockerfile. Keep its default entrypoint/start command.
 2. Attach a Railway Volume at **`/data`**. Run one instance against this volume.
+   Dedicate it to this service; do not put unrelated files or backups inside it.
 3. Set these service variables:
 
    ```env
@@ -44,6 +48,9 @@ is required. Use the same project ID in every connected application; the default
 5. Generate a public domain and set its **target port to `4000`**. The web UI
    is served on that port. `PORT` describes this public HTTP target; changing it
    does not change the ports in `firebase.json`.
+6. Configure Railway's HTTP healthcheck path as `/` with a 300-second startup
+   timeout. The Docker healthcheck also probes the UI, but configure Railway's
+   own deployment healthcheck explicitly. UI health is not a durability check.
 
 The other emulators are best accessed through Railway private networking by
 applications in the same Railway project/environment. Use this service's actual
@@ -103,36 +110,109 @@ Open <http://localhost:4000>. In another terminal, stop gracefully with
 `docker start -a firebase-emulator-suite`. No Docker socket is mounted or used
 inside the deployment.
 
-## Persistence and runtime
+## Persistence and shutdown
 
-The POSIX entrypoint creates `/data` and runs the CLI using `exec`, so it receives
-shutdown signals directly. It always uses `--export-on-exit=/data`, and adds
-`--import=/data` only when `/data/firebase-export-metadata.json` exists. The CLI
-restores exported Auth, Firestore, Database, and Storage data. An invalid export
-fails startup rather than silently discarding data.
+The volume at `/data` stores the latest complete emulator snapshot. An empty
+volume starts fresh. When `/data/firebase-export-metadata.json` exists, the
+entrypoint validates its JSON and referenced export paths and starts Firebase
+with `--import=/data`. Invalid snapshots or data without metadata fail startup
+instead of being silently overwritten. Existing exports from the previous image
+layout remain compatible; back up your volume before upgrading.
 
-The Dockerfile includes a guarded compatibility patch for Firebase CLI's export
-implementation (verified against 15.29.0). Upstream deletes and replaces the
-export directory, which fails with `EBUSY` at a mounted `/data`. The patch keeps
-the mount point, replaces its contents, and moves metadata last. It applies only
-to exports targeting `/data`; a changed upstream implementation fails the build
-and requires reviewing the patch. Dedicate this volume to emulator exports: its
-contents are replaced on export.
+A small POSIX shell wrapper stays as PID 1 so it can finish persistence after
+Firebase exits. It explicitly handles both SIGTERM and SIGINT, forwards one
+SIGTERM to Firebase, and waits for its actual exit status even when a signal
+interrupts `wait`. Additional graceful-stop signals do not interrupt synchronization.
+Firebase receives `--export-on-exit=/tmp/firebase-export`. This is an ordinary
+container directory that Firebase can replace safely; **Firebase never exports
+directly over the `/data` mount point**. No Firebase source files are patched.
 
-The volume stores **shutdown snapshots**, not continuous durable writes. Crashes,
-out-of-memory kills, or insufficient shutdown time can lose changes since the
-last successful export. Back up successful exports separately, and keep the same
-project ID when restoring. See [Firebase CLI persistence options](https://firebase.google.com/docs/emulator-suite/install_and_configure#startup_options).
+After Firebase stops successfully:
 
-The image starts from Node.js 22 on Debian Bookworm. Java 21 JRE is required
-internally by the Java-based emulators. Because Bookworm does not provide
-`openjdk-21-jre-headless`, the Dockerfile selects Debian Trixie for the Java
-installation and prioritizes Trixie security updates. This
-upgrades some runtime libraries; it is not a pure Bookworm package set.
+1. Validate the fresh temporary export. Missing or invalid exports cause a
+   nonzero exit and preserve the previous snapshot.
+2. Copy the previous volume contents into `/data/.firebase-previous`, flush them,
+   and create `/data/.firebase-sync-in-progress` before changing the saved data.
+3. Replace the contents of `/data` using standard file operations, copy
+   `firebase-export-metadata.json` last, validate and flush the new snapshot.
+4. Remove the transaction marker and rollback copy. The mount root itself is
+   never removed, renamed, or replaced. `lost+found` is left alone.
 
-`firebase-tools@latest` installs the stable npm release at build time. Emulator
-artifacts are downloaded during the build, requiring internet access then.
-Use `docker build --pull --no-cache` to refresh cached CLI/runtime layers and
-validate saved exports after updates. Retain a tested image digest for rollback.
-`JAVA_TOOL_OPTIONS` applies to each Java process, not to the whole container;
-allow memory for multiple JVMs, Node.js, and the UI (start with 4 GiB and monitor).
+A copy failure attempts to restore the previous snapshot and exits nonzero.
+If the container dies during synchronization, the marker causes restoration of
+that rollback copy at the next boot. Do not manually remove the hidden recovery
+files during a failed deployment. Snapshot copying requires volume capacity for
+both old and new data (roughly twice the larger snapshot) plus ephemeral disk
+space for Firebase's temporary export. Recovery is designed for interrupted file
+copies, not as a substitute for volume backups or protection against disk corruption.
+
+Data is held by the emulators while running; this is **not continuous durable
+storage**. SIGKILL, an out-of-memory kill, host failure, or a shutdown deadline
+can lose changes since the last successful snapshot. Allow enough time for both
+Firebase export and the volume copy. On Railway set
+`RAILWAY_DEPLOYMENT_DRAINING_SECONDS=120`, increase it for larger datasets, and
+verify the `Firebase snapshot persisted to /data.` log message. Graceful restarts
+and redeploys import the saved volume data. Keep the project ID consistent across
+restarts. See [Firebase's documented persistence flags](https://firebase.google.com/docs/emulator-suite/install_and_configure#startup_options).
+
+## Pinned runtime and updates
+
+- **Node.js 22.23.2**, copied from the official Node image.
+- **Eclipse Temurin Java 21.0.12+8 JRE**, using its official Ubuntu Noble image.
+  Java is required internally by the Firestore, Database, and Storage rules runtimes.
+- **Firebase CLI 15.29.0**, declared in `package.json`; `package-lock.json` locks
+  its dependency tree and integrity hashes. These files install tooling only;
+  there is no application framework. The runtime does not include npm.
+
+Both base-image releases are pinned by manifest digest in `Dockerfile`. Only the
+Node binary and CLI dependencies cross build stages; no Debian repositories or
+Debian system libraries are added to the Ubuntu runtime. Emulator artifacts are
+prefetched at image build time with the pinned CLI, avoiding startup downloads.
+Builds require network access. Dependency versions and base images are fixed;
+this does not promise byte-for-byte identical image timestamps or perpetual
+availability of upstream download servers.
+
+To update intentionally, change the image tags **and digests** in `Dockerfile`.
+On a machine with Node/npm, run
+`npm install --package-lock-only --save-exact firebase-tools@<version>` and commit
+both package files. Rebuild, run the tests below, and test restoration of a copy
+of your existing export before publishing the new image. Keep a tested image
+digest and volume backup for rollback. Pinned dependencies need periodic security
+reviews and updates; they do not update automatically.
+
+Dependency audit on 2026-09-08: `npm audit --omit=dev --package-lock-only`
+reported **9 moderate findings and no high/critical findings** in the locked npm
+dependency tree. Compatible automatic fixes made no changes. Findings include
+upstream `qs`, `stream-json`, OpenTelemetry, and `uuid` advisories and their parent
+dependency chains; this is not nine independent issues. For example, see the
+[qs denial-of-service advisory](https://github.com/advisories/GHSA-4mjr-xmp4-gh2g)
+and [stream-json denial-of-service advisory](https://github.com/advisories/GHSA-528h-pc64-c93x).
+Review current advisories and their reachability before exposing this service;
+this template does not claim to be vulnerability-free. The npm audit does not
+cover operating-system packages or the downloaded Java emulator artifacts.
+
+`JAVA_TOOL_OPTIONS` remains configurable and defaults to
+`-Xms256m -Xmx1024m`. This limit applies to each JVM, not the whole container.
+Allow memory for multiple JVMs, Node.js, the UI, and export work (start with 4 GiB
+and monitor). The Docker healthcheck requests `http://127.0.0.1:4000/` and checks
+for HTTP 200; it cannot guarantee successful future exports.
+
+## Validation before publishing
+
+```sh
+docker build -t firebase-emulator-suite .
+python3 tests/entrypoint.py
+python3 tests/smoke.py firebase-emulator-suite
+```
+
+The tests require Python 3, local Node.js for wrapper tests, and Docker for the
+container smoke test. They use disposable data and containers, never production
+Firebase credentials. They verify signal handling, failure/recovery behavior,
+all four service writes, and persistence across container replacement.
+
+The public UI is unauthenticated, the rules are intentionally open, and browser
+access to private emulator endpoints requires separate connectivity. Review those
+access choices, the volume attachment, healthcheck, shutdown grace period, and
+resource limits in your Railway template settings before publishing. The image
+is portable to ordinary Docker hosts and uses no Docker socket, external database,
+reverse proxy, or unrelated service at runtime.

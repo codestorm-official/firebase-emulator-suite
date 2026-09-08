@@ -1,0 +1,7 @@
+node_modules/
+.firebase/
+*-debug.log*
+firebase-export-*/
+
+__pycache__/
+*.pyc

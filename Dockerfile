@@ -1,62 +1,29 @@
-FROM node:22-bookworm
+# Official runtime releases pinned by multi-platform manifest digest.
+FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node
+WORKDIR /opt/firebase
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 
-# Bookworm does not package Java 21. Use Trixie for the Java install and
-# retain security updates; this also upgrades required system libraries.
-RUN printf '%s\n' \
-      'deb https://deb.debian.org/debian trixie main' \
-      'deb https://security.debian.org/debian-security trixie-security main' \
-      > /etc/apt/sources.list.d/java21.list \
-    && printf '%s\n' \
-      'Package: *' 'Pin: release n=trixie' 'Pin-Priority: 100' '' \
-      'Package: *' 'Pin: release n=trixie-security' 'Pin-Priority: 990' \
-      > /etc/apt/preferences.d/java21 \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends -t trixie openjdk-21-jre-headless \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN npm install --global firebase-tools@latest \
-    && npm cache clean --force
-
+# Java and its OS libraries stay in their supported Ubuntu Noble image.
+# Only Node's portable binary and the locked CLI dependencies are copied.
+FROM eclipse-temurin:21.0.12_8-jre-noble@sha256:96975602e131485862eb8cd32927face8a06d7591a5e865944b634a701d9df72
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /opt/firebase /opt/firebase
+ENV PATH="/opt/firebase/node_modules/.bin:${PATH}"
 WORKDIR /app
-COPY firebase.json firestore.rules database.rules.json storage.rules entrypoint.sh ./
-RUN chmod +x /app/entrypoint.sh \
+RUN node --version && java -version \
     && firebase setup:emulators:firestore \
     && firebase setup:emulators:database \
     && firebase setup:emulators:storage \
     && firebase setup:emulators:ui
-
-
-# Firebase CLI replaces the export directory, which fails with EBUSY when
-# /data is a mounted volume. Preserve the mount and commit metadata last.
-# Fail the build if upstream changes this code, so upgrades require review.
-RUN node <<'NODE'
-const fs = require('node:fs');
-const file = '/usr/local/lib/node_modules/firebase-tools/lib/emulator/hubExport.js';
-const source = fs.readFileSync(file, 'utf8');
-const original = `(0, node_fs_1.rmSync)(this.exportPath, { recursive: true });
-        fse.moveSync(this.tmpDir, this.exportPath);`;
-if (source.split(original).length !== 2) {
-  throw new Error('Firebase export implementation changed; review the /data mount compatibility patch.');
-}
-const replacement = `if (require('node:path').resolve(this.exportPath) === '/data') {
-            fse.emptyDirSync(this.exportPath);
-            const names = fse.readdirSync(this.tmpDir)
-                .filter(name => name !== HubExport.METADATA_FILE_NAME);
-            names.push(HubExport.METADATA_FILE_NAME);
-            for (const name of names) {
-                fse.moveSync(require('node:path').join(this.tmpDir, name),
-                    require('node:path').join(this.exportPath, name));
-            }
-            fse.removeSync(this.tmpDir);
-        } else {
-            ${original}
-        }`;
-fs.writeFileSync(file, source.replace(original, replacement));
-NODE
+COPY firebase.json firestore.rules database.rules.json storage.rules entrypoint.sh ./
+RUN chmod +x /app/entrypoint.sh
 
 ENV PORT=4000 \
     FIREBASE_PROJECT_ID=demo-railway \
     JAVA_TOOL_OPTIONS="-Xms256m -Xmx1024m"
-
 EXPOSE 4000 4400 8080 9000 9099 9199
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD node -e 'const r=require("node:http").get("http://127.0.0.1:4000/",s=>process.exit(s.statusCode===200?0:1));r.setTimeout(4000,()=>{r.destroy();process.exit(1)});r.on("error",()=>process.exit(1));'
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/app/entrypoint.sh"]

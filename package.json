@@ -1,0 +1,9 @@
+{
+  "name": "railway-firebase-emulator-suite",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Locked Firebase CLI dependencies for the deployment image",
+  "dependencies": {
+    "firebase-tools": "15.29.0"
+  }
+}
