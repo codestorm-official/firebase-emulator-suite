@@ -1,0 +1,8 @@
+{
+  // Intentionally open for emulator development/testing only.
+  // NEVER copy these rules to production. Firebase rules support comments.
+  "rules": {
+    ".read": true,
+    ".write": true
+  }
+}

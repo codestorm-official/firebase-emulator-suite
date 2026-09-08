@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!firebase.json
+!firestore.rules
+!database.rules.json
+!storage.rules
+!entrypoint.sh
