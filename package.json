@@ -4,6 +4,6 @@
   "private": true,
   "description": "Locked Firebase CLI dependencies for the deployment image",
   "dependencies": {
-    "firebase-tools": "15.29.0"
+    "firebase-tools": "15.36.0"
   }
 }
